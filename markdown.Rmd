@@ -28,12 +28,10 @@ library(stringr)
 library(fixest)
 library(rlang)
 
-# Load dataset
-ds <- open_dataset('./new_data/') 
 
 # This function loads the dataset between date_min and date_max (give them in format 'yyyy-mm-dd')
 # If filter_na = TRUE, the function will not retrieve observations with no data either on flow or on occupancy rate
-# If short = TRUE, the function will not retrieve the geometrical information (lighter for memory)
+# If short = TRUE, the function will not retrieve the geometrical information (lighter for memory use so by default use this option!)
 
 loading_function = function(date_min, date_max, filter_na = TRUE,short=TRUE) {
   
@@ -60,7 +58,7 @@ loading_function = function(date_min, date_max, filter_na = TRUE,short=TRUE) {
 # Useful informations:
 vehicle_length = 0.0045 # vehicle length mean is 4.5 meters
 
-load('ref_ring.RData')
+load('ref_ring.RData') #This RData file contains the geographical referential for the roads used in the analysis
 
 gc()
   
@@ -72,7 +70,7 @@ gc()
 # Computing the model on ring road
 ```{r}
 
-ds <- open_dataset('./trafic_dataset/')
+ds <- open_dataset('./data/ring.parquet')
 
 categories_function_ring = function(df){
   Final = df %>% 
@@ -96,7 +94,8 @@ categories_function_ring = function(df){
 
 date_min = "2013-09-01"
 date_max = "2019-09-01"
-df_ring = loading_function(date_min,date_max)
+df_ring = loading_function(date_min,date_max) %>% 
+  filter(iu_ac %in% c(PE_north_control_clean$Identifiant.arc, PE_control_clean$Identifiant.arc,PI_control_clean$Identifiant.arc,PI_north_control_clean$Identifiant.arc))
 
 Final = categories_function_ring(df_ring)
 
@@ -174,7 +173,7 @@ ggplot(results, aes(x = year_rel, y = beta, color = subset)) +
 
 # Computing the model on local road
 ```{r}
-ds <- open_dataset('./new_data/')
+ds <- open_dataset('./data/local.parquet')
 
 categories_function_local = function(df){
   Final = df %>% 
