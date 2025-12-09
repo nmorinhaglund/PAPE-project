@@ -29,7 +29,7 @@ library(fixest)
 library(rlang)
 
 # Load dataset
-ds <- open_dataset('./trafic_dataset') 
+ds <- open_dataset('./new_data/') 
 
 # This function loads the dataset between date_min and date_max (give them in format 'yyyy-mm-dd')
 # If filter_na = TRUE, the function will not retrieve observations with no data either on flow or on occupancy rate
@@ -38,7 +38,7 @@ ds <- open_dataset('./trafic_dataset')
 loading_function = function(date_min, date_max, filter_na = TRUE,short=TRUE) {
   
   if (short == TRUE) {
-    filtered_cols = c("libelle", "t_1h", "q", "k")
+    filtered_cols = c("iu_ac","libelle", "t_1h", "q", "k")
   } else {
     filtered_cols = c("iu_ac", "libelle", "iu_nd_amont", "iu_nd_aval","t_1h", "q", "k", "etat_trafic", "etat_barre", "geometry")
   }
@@ -55,7 +55,26 @@ loading_function = function(date_min, date_max, filter_na = TRUE,short=TRUE) {
   return(res)
 }
 
-categories_function = function(df){
+
+
+# Useful informations:
+vehicle_length = 0.0045 # vehicle length mean is 4.5 meters
+
+load('ref_ring.RData')
+
+gc()
+  
+  
+```
+
+
+
+# Computing the model on ring road
+```{r}
+
+ds <- open_dataset('./trafic_dataset/')
+
+categories_function_ring = function(df){
   Final = df %>% 
     mutate(treated = libelle %in% PE_control_clean$Libelle|libelle %in% PI_north_control_clean$Libelle) %>% # TRUE if arc is in the treated subset
     mutate(post = ymd(as.Date(t_1h)) > ymd("2016-09-01")) %>% # After ou before the VGP closure
@@ -75,26 +94,11 @@ categories_function = function(df){
 }
 
 
-# Useful informations:
-vehicle_length = 0.0045 # vehicle length mean is 4.5 meters
-
-load('ref_ring.RData')
-
-gc()
-  
-  
-```
-
-
-
-# Computing the model
-```{r}
-
 date_min = "2013-09-01"
 date_max = "2019-09-01"
-df = loading_function(date_min,date_max)
+df_ring = loading_function(date_min,date_max)
 
-Final = categories_function(df)
+Final = categories_function_ring(df_ring)
 
 did_model <- feols(
   q ~ treated * post | libelle + t_1h,
@@ -167,5 +171,207 @@ ggplot(results, aes(x = year_rel, y = beta, color = subset)) +
 ```
 
 
+
+# Computing the model on local road
+```{r}
+ds <- open_dataset('./new_data/')
+
+categories_function_local = function(df){
+  Final = df %>% 
+    mutate(treated = libelle %in% Bd_St_Germain$Libelle|libelle %in% Upper_bank$Libelle) %>% # TRUE if arc is in the treated subset
+    mutate(post = ymd(as.Date(t_1h)) > ymd("2016-09-01")) %>% # After ou before the VGP closure
+    mutate(year_rel = floor(time_length(ymd(as.Date(t_1h)) - ymd("2016-08-31"), "year"))) %>% # year relative to VGP closure
+    mutate(log_flow = log(q),log_occupancy = log(k)) %>% # Log of the flow and occupancy of cars
+    mutate(date = as.Date(t_1h)) %>%
+    mutate(wday = wday(ymd(date))) %>% # Day of the week (1 = Saturday, 2 = Monday, ..., 7 = Sunday)
+    mutate(hours = hour(t_1h)) %>% # Hour of the day (0 to 23)
+    mutate(day_hour = paste0(wday,'_',hours)) %>% # Wednesday at 8AM = "4_8" and Sunday at 7PM =  "7_19"
+    mutate(road = case_when(libelle %in% Upper_bank$Libelle ~ "LB",
+                            libelle %in% Upper_bank$Libelle ~ "UB",
+                            libelle %in% Bd_St_Germain$Libelle ~ "BSG",
+                            ))
+  
+  Final$daytime = ifelse(Final$hours %in% c(8:20),TRUE,FALSE)
+  Final$morning = ifelse(Final$hours %in% c(8:10),TRUE,FALSE)
+  Final$evening = ifelse(Final$hours %in% c(18:20),TRUE,FALSE)
+  
+  return(Final)
+}
+
+date_min = "2013-09-01"
+date_max = "2019-09-01"
+df_local = loading_function(date_min,date_max)
+
+df_tot = rbind(df_ring,df_local)
+
+Final = categories_function_local(df_local)
+
+did_model <- feols(
+  q ~ treated * post | libelle + t_1h,
+  data = Final,
+  cluster = ~libelle
+)
+
+summary(did_model)
+
+
+# A function to compute the event model:
+#   - Final is the data frame with the data filtered and with the categories
+#   - subset is a CONDITION input ! e.g. "north == TRUE"
+#   - variable to compute the model, e.g. "q", "k", "log_flow", "log_occupancy"...
+
+compute_event_model = function(Final,subset,variable) {
+  
+  if (!is.null(subset)){
+    df = Final %>% filter(!!parse_expr(subset))
+  } else {df = Final}
+  
+  event_model <- feols(
+    k ~ i(year_rel, treated, ref = "-1") | libelle + day_hour,
+    data = df,
+    cluster = ~libelle
+  )
+  
+  summary(event_model)
+  
+  betas <- coef(event_model)
+  ses <- se(event_model)
+  
+  results<- data.frame(
+    coef_name = names(betas),
+    beta = betas,
+    se = ses,
+    ci_low = betas - 1.96 * ses,
+    ci_high = betas + 1.96 * ses
+  )
+
+  results = results %>% mutate(year_rel = sapply(coef_name,function(x) {return(unlist(str_split(x,":"))[3])}))
+  results[6,] = c("year_rel::-1:treated",0,0,0,0,-1) # Add a line for the reference year (-1) with an estimate and se = 0
+  results = results %>% select(-coef_name) %>% mutate(across(everything(),as.numeric))
+  
+  return(results)
+}
+
+results_all = compute_event_model(Final,subset = NULL,k)
+results_south = compute_event_model(Final, subset = "north == FALSE",k)
+
+results_south$subset = "South ring roads"
+results_all$subset = "Full sample"
+
+
+results = rbind(results_south,results_all)
+
+ggplot(results, aes(x = year_rel, y = beta, color = subset)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray") +
+  geom_point(size = 2, position = position_dodge(width = 0.3)) +
+  geom_errorbar(aes(ymin = ci_low, ymax = ci_high), width = 0,position = position_dodge(width = 0.3)) +
+  geom_line(position = position_dodge(width = 0.3))+
+  labs(
+    x = "Year relative to VGP closure",
+    y = "Estimates (β_k)",
+    title = "Effect of VGP closure on car occupancy rate"
+  ) +
+  theme_minimal() + 
+  scale_color_manual(values = c("Full sample" = "black", "South ring roads" = "darkgrey"))
+
+```
+
+
+```{r}
+
+
+compute_model_plot = function(variable){
+  
+  fml <- as.formula(paste0(variable, " ~ i(year_rel, treated, ref = '-1') | libelle + day_hour"))
+  
+  event_model_daytime <- feols(
+    fml,
+    data = Final %>% filter(daytime == TRUE, road %in% c("BSG","UB","LB"), wday %in% c(2:6)),
+    cluster = ~libelle
+  )
+  event_model_evening <- feols(
+    fml,
+    data = Final %>% filter(evening == TRUE, road %in% c("BSG","UB","LB"), wday %in% c(2:6)),
+    cluster = ~libelle
+  )
+  event_model_morning <- feols(
+    fml,
+    data = Final %>% filter(morning == TRUE, road %in% c("BSG","UB","LB"), wday %in% c(2:6)),
+    cluster = ~libelle
+  )
+  
+  
+  betas_morning <- coef(event_model_morning)
+  ses_morning <- se(event_model_morning)
+  
+  results_morning <- data.frame(
+    coef_name = names(betas_morning),
+    beta = betas_morning,
+    se = ses_morning,
+    ci_low = betas_morning - 1.96 * ses_morning,
+    ci_high = betas_morning + 1.96 * ses_morning
+  )
+  
+  betas_evening <- coef(event_model_evening)
+  ses_evening <- se(event_model_evening)
+  
+  results_evening <- data.frame(
+    coef_name = names(betas_evening),
+    beta = betas_evening,
+    se = ses_evening,
+    ci_low = betas_evening - 1.96 * ses_evening,
+    ci_high = betas_evening + 1.96 * ses_evening
+  )
+  
+  betas_daytime <- coef(event_model_daytime)
+  ses_daytime <- se(event_model_daytime)
+  
+  results_daytime <- data.frame(
+    coef_name = names(betas_daytime),
+    beta = betas_daytime,
+    se = ses_daytime,
+    ci_low = betas_daytime - 1.96 * ses_daytime,
+    ci_high = betas_daytime + 1.96 * ses_daytime
+  )
+  
+  results_morning = results_morning %>% mutate(year_rel = sapply(coef_name,function(x) {return(unlist(str_split(x,":"))[3])}) %>% as.numeric())
+  results_morning[6,] = c("year_rel::-1:treated",0,0,0,0,-1)
+  results_morning = results_morning %>% select(-coef_name) %>% mutate(across(everything(),as.numeric))
+  
+  results_evening = results_evening %>% mutate(year_rel = sapply(coef_name,function(x) {return(unlist(str_split(x,":"))[3])}) %>% as.numeric())
+  results_evening[6,] = c("year_rel::-1:treated",0,0,0,0,-1)
+  results_evening = results_evening %>% select(-coef_name) %>% mutate(across(everything(),as.numeric))
+  
+  results_daytime = results_daytime %>% mutate(year_rel = sapply(coef_name,function(x) {return(unlist(str_split(x,":"))[3])}) %>% as.numeric())
+  results_daytime[6,] = c("year_rel::-1:treated",0,0,0,0,-1)
+  results_daytime = results_daytime %>% select(-coef_name) %>% mutate(across(everything(),as.numeric))
+  
+  
+  
+  results_daytime$hour = "daytime"
+  results_morning$hour = 'morning'
+  results_evening$hour = "evening"
+  
+  results = rbind(results_daytime,results_evening,results_morning)
+  
+  ggplot(results, aes(x = year_rel, y = beta, color = hour, shape = hour)) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray") +
+    geom_point(size = 2, position = position_dodge2(0.5)) +
+    geom_errorbar(aes(ymin = ci_low, ymax = ci_high), width = 0, position = position_dodge(0.5)) +
+    geom_line(position = position_dodge2(0.5))+
+    labs(
+      x = "Année relative à la réforme",
+      y = "Effet estimé (β_k)",
+      title = "Effet estimé du traitement (event study)"
+    ) +
+    theme_minimal() + 
+    scale_color_manual(values = c("black","darkgrey","darkblue"))
+}
+
+
+compute_model_plot("log_occupancy")
+
+
+```
 
 
