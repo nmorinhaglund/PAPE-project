@@ -11,7 +11,8 @@ output:
 
 To load the data correctly, the R-project file should be placed in dir containing:
 1) a repertory "data" containing all the data parquet files ("local.parquet")
-2) the ref_ring.RData file
+2) the ref_ring.RData file (containing the roads referentials)
+3) the pollution.csv file (containing NO2 measures and meteorological data)
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
@@ -106,15 +107,30 @@ ref_ring_roads$length = compute_arc_length(ref_ring_roads)
 
 # Speed function
 
-In the model, the speed is defined as $S(i,t) = \frac{Flow(i,t) * (L + Ki)}{Occupancy(i,t)}$ 
+In the model, the speed is defined as :
+
+$S(i,t) = \frac{Flow(i,t) * (L + Ki)}{Occupancy(i,t)}$
+
+with $Ki$ being the length of the road arc.
+
+Yet, this formula does not correspond to the model as described in Hall et al. (1996). Indeed, the paper describes here the $Ki$ as being the length of the ***sensor*** and not of the ***road***. 
+
+Lea Bou Sleiman explains in the footnote (p7) that the sensor does cover the entirety of the road, which does not hold (those types of captor are only a few meters long, while an arc road is approx. 200m). For instance, if we compute the speed with average parameters from the dataset : 
+
+$q = 1500$ cars/hour ; $k = 10\%$ ; $L = 0.0045$ km ; $K = 0.2$ km 
+$S = \frac{1500 * 0.204}{0.1} = 3060$ km/h !
+
+Since the author finds coherent values for her statistics that do not seem to reflect the formula. We chose to simply use the formula so that it fits the data, by ignoring vehicle length, and taking $Ki = 0.8$ meters for every roads. We chose this value by randomly sampling data points where the traffic was fluid (high flow and low occupancy rate), so that speed is at its maximum. We thus could calibrate it based on speed limitation (70 km/h on ring road, 50 km/h on local roads) and on speed statitics.
+
+
 ```{r}
 
-compute_speed = function(df) {
+compute_speed_Sleiman = function(df) {
   return(df$q *(vehicle_length + as.numeric(df$length))/df$k)
 }
 
 
-compute_speed_test = function(df) {
+compute_speed_corrected = function(df) {
   return(df$q * 0.0008/(df$k/100))
 }
 ```
@@ -275,7 +291,7 @@ Final_local$congestion = ifelse(Final_local$k > Final_local$kc,1,0)
 
 Final_local = left_join(Final_local,ref_local_roads %>% select(Identifiant.arc,length),by=c('iu_ac'='Identifiant.arc'), relationship = "many-to-many")
 Final_local$length = as.numeric(Final_local$length)
-Final_local$speed = compute_speed_test(Final_local)
+Final_local$speed = compute_speed_corrected(Final_local)
 Final_local$log_speed = log(Final_local$speed)
 
 
