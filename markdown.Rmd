@@ -2,13 +2,15 @@
 title: "Markdown_project_PAPE"
 author: "nilsm"
 date: "2025-11-04"
-output: html_document
+output:
+  html_document: default
+  pdf_document: default
 ---
 
 # Loading the data
 
 To load the data correctly, the R-project file should be placed in dir containing:
-1) a repertory "traffic_dataset" containing all the data parquet files ("results_2014.parquet")
+1) a repertory "data" containing all the data parquet files ("local.parquet")
 2) the ref_ring.RData file
 
 ```{r setup, include=FALSE}
@@ -27,6 +29,8 @@ library(mapedit)
 library(stringr)
 library(fixest)
 library(rlang)
+library(zoo)
+library(gridExtra)
 
 
 # This function loads the dataset between date_min and date_max (give them in format 'yyyy-mm-dd')
@@ -87,7 +91,7 @@ convert_to_sf <- function(df, col) {
 }
 
 compute_arc_length = function(arc) {
-  return(st_length(st_transform(arc, 32631))/1000)
+  return(st_length(st_transform(arc, 2154))/1000)
 }
 
 ref_local_roads = rbind(Bd_St_Germain,Upper_bank,Lower_bank) %>% convert_to_sf(.,"geo_shape")
@@ -106,9 +110,13 @@ In the model, the speed is defined as $S(i,t) = \frac{Flow(i,t) * (L + Ki)}{Occu
 ```{r}
 
 compute_speed = function(df) {
-  df$speed = df$q *(vehicle_length + as.numeric(df$length))/df$k
+  return(df$q *(vehicle_length + as.numeric(df$length))/df$k)
 }
 
+
+compute_speed_test = function(df) {
+  return(df$q * 0.0008/(df$k/100))
+}
 ```
 
 
@@ -120,7 +128,7 @@ compute_speed = function(df) {
 ds <- open_dataset('./data/ring.parquet')
 
 categories_function_ring = function(df){
-  Final = df %>% 
+  Final_ring = df %>% 
     mutate(treated = libelle %in% PE_control_clean$Libelle|libelle %in% PI_north_control_clean$Libelle) %>% # TRUE if arc is in the treated subset
     mutate(post = ymd(as.Date(t_1h)) > ymd("2016-09-01")) %>% # After ou before the VGP closure
     mutate(year_rel = floor(time_length(ymd(as.Date(t_1h)) - ymd("2016-08-31"), "year"))) %>% # year relative to VGP closure
@@ -131,11 +139,11 @@ categories_function_ring = function(df){
     mutate(day_hour = paste0(wday,'_',hours)) %>% # Wednesday at 8AM = "4_8" and Sunday at 7PM =  "7_19"
     mutate(north = libelle %in% PI_north_control_clean$Libelle|libelle %in% PE_north_control_clean$Libelle)
   
-  Final$daytime = ifelse(Final$hours %in% c(8:20),TRUE,FALSE)
-  Final$morning = ifelse(Final$hours %in% c(8:10),TRUE,FALSE)
-  Final$evening = ifelse(Final$hours %in% c(18:20),TRUE,FALSE)
+  Final_ring$daytime = ifelse(Final_ring$hours %in% c(8:20),TRUE,FALSE)
+  Final_ring$morning = ifelse(Final_ring$hours %in% c(8:10),TRUE,FALSE)
+  Final_ring$evening = ifelse(Final_ring$hours %in% c(18:20),TRUE,FALSE)
   
-  return(Final)
+  return(Final_ring)
 }
 
 
@@ -144,13 +152,13 @@ date_max = "2019-09-01"
 df_ring = loading_function(date_min,date_max) %>% 
   filter(iu_ac %in% c(PE_north_control_clean$Identifiant.arc, PE_control_clean$Identifiant.arc,PI_control_clean$Identifiant.arc,PI_north_control_clean$Identifiant.arc))
 
-Final = categories_function_ring(df_ring)
+Final_ring = categories_function_ring(df_ring)
 
-Final = Final %>% filter((is.na(q) & is.na(k))==F)
+Final_ring = Final_ring %>% filter((is.na(q) & is.na(k))==F)
 
 did_model <- feols(
   q ~ treated * post | libelle + t_1h,
-  data = Final,
+  data = Final_ring,
   cluster = ~libelle
 )
 
@@ -158,15 +166,15 @@ summary(did_model)
 
 
 # A function to compute the event model:
-#   - Final is the data frame with the data filtered and with the categories
+#   - Final_ring is the data frame with the data filtered and with the categories
 #   - subset is a CONDITION input ! e.g. "north == TRUE"
 #   - variable to compute the model, e.g. "q", "k", "log_flow", "log_occupancy"...
 
-compute_event_model = function(Final,subset,variable) {
+compute_event_model = function(Final_ring,subset,variable) {
   
   if (!is.null(subset)){
-    df = Final %>% filter(!!parse_expr(subset))
-  } else {df = Final}
+    df = Final_ring %>% filter(!!parse_expr(subset))
+  } else {df = Final_ring}
   
   event_model <- feols(
     k ~ i(year_rel, treated, ref = "-1") | libelle + day_hour,
@@ -194,8 +202,8 @@ compute_event_model = function(Final,subset,variable) {
   return(results)
 }
 
-results_all = compute_event_model(Final,subset = NULL,k)
-results_south = compute_event_model(Final, subset = "north == FALSE",k)
+results_all = compute_event_model(Final_ring,subset = NULL,k)
+results_south = compute_event_model(Final_ring, subset = "north == FALSE",k)
 
 results_south$subset = "South ring roads"
 results_all$subset = "Full sample"
@@ -225,7 +233,7 @@ ggplot(results, aes(x = year_rel, y = beta, color = subset)) +
 ds <- open_dataset('./data/local.parquet')
 
 categories_function_local = function(df){
-  Final = df %>% 
+  Final_local = df %>% 
     mutate(treated = libelle %in% Bd_St_Germain$Libelle|libelle %in% Upper_bank$Libelle) %>% # TRUE if arc is in the treated subset
     mutate(post = ymd(as.Date(t_1h)) > ymd("2016-09-01")) %>% # After ou before the VGP closure
     mutate(year_rel = floor(time_length(ymd(as.Date(t_1h)) - ymd("2016-08-31"), "year"))) %>% # year relative to VGP closure
@@ -239,57 +247,62 @@ categories_function_local = function(df){
                             libelle %in% Bd_St_Germain$Libelle ~ "BSG",
                             ))
   
-  Final$daytime = ifelse(Final$hours %in% c(8:19),TRUE,FALSE)
-  Final$morning = ifelse(Final$hours %in% c(8:9),TRUE,FALSE)
-  Final$evening = ifelse(Final$hours %in% c(18:19),TRUE,FALSE)
+  Final_local$daytime = ifelse(Final_local$hours %in% c(8:19),TRUE,FALSE)
+  Final_local$morning = ifelse(Final_local$hours %in% c(8:9),TRUE,FALSE)
+  Final_local$evening = ifelse(Final_local$hours %in% c(18:19),TRUE,FALSE)
   
-  return(Final)
+  return(Final_local)
 }
 
 date_min = "2013-09-01"
 date_max = "2019-09-01"
 df_local = loading_function(date_min,date_max)
 
-df_tot = rbind(df_ring,df_local)
 
-Final = categories_function_local(df_local)
+Final_local = categories_function_local(df_local)
 
 k_c = list()
-for (i in unique(Final$iu_ac)){
-  df = Final %>% filter(iu_ac == i, is.na(q) == F & is.na(k) == F)
+for (i in unique(Final_local$iu_ac)){
+  df = Final_local %>% filter(iu_ac == i, is.na(q) == F & is.na(k) == F)
   if(nrow(df) == 0){k_c[i]=NA
     }else{
     k_c[i] = -coef(lm(q ~ 0 + k + I(k^2), data = df))[1]/(2*coef(lm(q ~ 0 + k + I(k^2), data = df))[2])
     }
 }
 
-Final$kc = k_c[Final$iu_ac]
-Final$congestion = ifelse(Final$k > Final$kc,1,0)
+Final_local$kc = k_c[Final_local$iu_ac]
+Final_local$congestion = ifelse(Final_local$k > Final_local$kc,1,0)
+
+Final_local = left_join(Final_local,ref_local_roads %>% select(Identifiant.arc,length),by=c('iu_ac'='Identifiant.arc'), relationship = "many-to-many")
+Final_local$length = as.numeric(Final_local$length)
+Final_local$speed = compute_speed_test(Final_local)
+Final_local$log_speed = log(Final_local$speed)
+
 
 did_model <- feols(
-  q ~ treated * post | libelle + t_1h,
-  data = Final,
-  cluster = ~libelle
+  q ~ treated * post | iu_ac + t_1h,
+  data = Final_local,
+  cluster = ~iu_ac
 )
 
 summary(did_model)
 
 
 # A function to compute the event model:
-#   - Final is the data frame with the data filtered and with the categories
+#   - Final_local is the data frame with the data filtered and with the categories
 #   - subset is a CONDITION input ! e.g. "north == TRUE"
 #   - variable to compute the model, e.g. "q", "k", "log_flow", "log_occupancy"...
 
-compute_event_model = function(Final,subset,variable) {
+compute_event_model = function(Final_local,subset,variable) {
   
   if (!is.null(subset)){
-    df = Final %>% filter(!!parse_expr(subset))
-  } else {df = Final}
+    df = Final_local %>% filter(!!parse_expr(subset))
+  } else {df = Final_local}
   
   event_model <- feols(
-    k ~ i(year_rel, treated, ref = "-1") | libelle + day_hour,
+    k ~ i(year_rel, treated, ref = "-1") | iu_ac + day_hour,
     data = df,
-    cluster = ~libelle
+    cluster = ~iu_ac
   )
   
   summary(event_model)
@@ -312,14 +325,16 @@ compute_event_model = function(Final,subset,variable) {
   return(results)
 }
 
-results_all = compute_event_model(Final,subset = NULL,k)
-results_south = compute_event_model(Final, subset = "north == FALSE",k)
+results_all = compute_event_model(Final_local,subset = NULL,k)
+results_all$subset = "all"
 
-results_south$subset = "South ring roads"
-results_all$subset = "Full sample"
+results_BSG = compute_event_model(Final_local, subset = "road != \"UB\"",k)
+results_BSG$subset = "BSG"
 
+results_UB = compute_event_model(Final_local, subset = "road != \"BSG\"",k)
+results_UB$subset = "UB"
 
-results = rbind(results_south,results_all)
+results = rbind(results_all,results_BSG,results_UB)
 
 ggplot(results, aes(x = year_rel, y = beta, color = subset)) +
   geom_hline(yintercept = 0, linetype = "dashed", color = "gray") +
@@ -332,13 +347,15 @@ ggplot(results, aes(x = year_rel, y = beta, color = subset)) +
     title = "Effect of VGP closure on car occupancy rate"
   ) +
   theme_minimal() + 
-  scale_color_manual(values = c("Full sample" = "black", "South ring roads" = "darkgrey"))
+  scale_color_manual(values = c("all" = "black", "BSG" = "darkgrey", "UB" = "darkblue"),
+                     labels = c("all" = "Full sample - local", "BSG" = "Bd St Germain only", "UB" = "Upper bank only"))
 
 ```
 
 
 ```{r}
 
+Final = Final_local
 
 compute_model_plot = function(variable){
   
@@ -422,8 +439,7 @@ compute_model_plot = function(variable){
     labs(
       x = "Year relative to reform",
       y = paste0("Estimated effect (β_k) on ",as.character(variable)),
-      title = "Estimated effect by time periods"
-    ) +
+      ) +
     theme_minimal() + 
     scale_color_manual(values = c("black","darkgrey","darkblue"))
 }
@@ -435,7 +451,7 @@ plot_flow = compute_model_plot("log_flow")
 plot_speed = compute_model_plot("log_speed")
 plot_congestion = compute_model_plot('congestion')
 
-
+combined = grid.arrange(plot_occupancy,plot_flow,plot_speed,plot_congestion)
 ```
 
 ```{r}
@@ -445,46 +461,88 @@ library(dplyr)
 library(zoo)      # pour rollmean
 library(ggplot2)
 
-Final_na <- Final %>%
-  mutate(log_occupancy = na_if(log_occupancy, -Inf))
+long_run_tendency = function(df, variable, type){
+  variable = enquo(variable)
+  Final_na <- df %>%
+    mutate(!!variable := na_if(!!variable, -Inf))
 
-df_monthly <- Final_na %>%
-  mutate(month = floor_date(date, "month")) %>%   # transforme la date en AAAA-MM-01
-  group_by(iu_ac, month, treated) %>%             # agrégation mensuelle par route
-  summarise(
-    mean_log_occ = mean(log_occupancy, na.rm = TRUE),
-    .groups = "drop"
-  )
 
-df_roll <- df_monthly %>%
-  arrange(iu_ac, month) %>%
-  group_by(iu_ac) %>%
-  mutate(
-    occ_roll12 = zoo::rollmean(
-      mean_log_occ, 
-      k = 12,
-      align = "right",
-      fill = NA,
-      na.rm = TRUE
+
+  df_monthly <- Final_na %>%
+    mutate(month = floor_date(date, "month")) %>%   # transforme la date en AAAA-MM-01
+    group_by(iu_ac, month, treated) %>%             # agrégation mensuelle par route
+    summarise(
+      mean_variable = mean(!!variable, na.rm = TRUE),
+      .groups = "drop"
     )
-  ) %>%
-  ungroup()
+  
+  df_roll <- df_monthly %>%
+    arrange(iu_ac, month) %>%
+    group_by(iu_ac) %>%
+    mutate(
+      roll12 = zoo::rollmean(
+        mean_variable, 
+        k = 12,
+        align = "right",
+        fill = NA,
+        na.rm = TRUE
+      )
+    ) %>%
+    ungroup()
+  
+  df_roll_bis = df_roll %>% 
+    group_by(treated, month) %>% 
+    summarise(roll12 = mean(roll12,na.rm=TRUE))
+  
+  
+  ggplot(df_roll_bis, aes(x = month, y = roll12, color = factor(treated))) +
+    geom_line(size = 1.1) +
+    theme_minimal(base_size = 14) +
+    geom_vline(xintercept = as.Date("2016-09-01")) +
+    labs(
+      title = paste0(str_split(as_name(variable), '_')[1]," tendency - ", type),
+      x = "Month",
+      y = paste0("Rolling mean of ", str_replace(as_name(variable), '_',' '))
+    )
+}
 
-df_roll_bis = df_roll %>% 
-  group_by(treated, month) %>% 
-  summarise(occ_roll12 = mean(occ_roll12,na.rm=TRUE))
+local_occup = long_run_tendency(Final_local, log_occupancy, "local")
+local_flow = long_run_tendency(Final_local, log_flow, "local")
+ring_flow = long_run_tendency(Final_ring,log_flow,"ring")
+ring_occup = long_run_tendency(Final_ring, log_occupancy, "local")
+
+```
+# Air pollution
+
+```{r}
+pollution = read.csv("pollution.csv") %>% mutate(hour = hour(ymd_hms(date))) %>% mutate(date = as.Date(date)) %>% rename(wnd_direction = direction, wnd_speed = speed, wnd_tmp = tmp)
+
+pollution$hour[is.na(pollution$hour)] = 0
 
 
-ggplot(df_roll_bis, aes(x = month, y = occ_roll12, color = factor(treated))) +
-  geom_line(size = 1.1) +
-  theme_minimal(base_size = 14) +
-  labs(
-    title = "Common trends — 12-month rolling mean",
-    x = "Month",
-    y = "Rolling mean of log occupancy"
-  )
+ring_pollution_ids = c("5360","5336","5332","5337","5335","5334","5358","5333","5328","5351","5327","5326","5329","5330","5347","5331")
+
+ub_pollution_ids = c("11","444","447","6555","6299","3","4","440","12","10","9","442","7","438","645","5","6","446","4","8","3")
+
+date_min = "2013-09-01"
+date_max = "2016-09-01"
+
+df_ring_pollution = Final_ring %>% filter(iu_ac %in% ring_pollution_ids, date %within% interval(date_min,date_max)) 
+
+df_ub_pollution = Final_local %>% filter(iu_ac %in% ub_pollution_ids, date %within% interval(date_min,date_max))
 
 
 
+pollution_ring = left_join(df_ring_pollution,pollution %>% filter(loc == "ring"),by=c('date'='date','hours'='hour'),relationship = "many-to-many") 
+
+pollution_ub = left_join(df_ub_pollution,pollution %>% filter(loc == "VGP"),by=c('date'='date','hours'='hour'),relationship = "many-to-many")
+
+
+model_pollution = feols(log(NO2) ~ log_speed + q + wnd_speed + wnd_direction + wnd_tmp | hours + month(date) + wday,
+    data = pollution_ub %>% filter(is.na(log_speed) == F,abs(log_speed)!=Inf),
+    cluster = ~iu_ac)
+
+
+summary(model_pollution)
 ```
 
