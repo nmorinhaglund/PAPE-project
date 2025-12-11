@@ -66,6 +66,53 @@ gc()
 ```
 
 
+# Computing arc roads
+```{r}
+
+geojson_to_sfg <- function(geojson) {
+  geo <- fromJSON(geojson)
+  coords <- geo$coordinates
+  coords <- matrix(coords, ncol = 2)
+  st_linestring(coords)  # retourne un objet sfg
+}
+
+convert_to_sf <- function(df, col) {
+  df_name <- deparse(substitute(df))   # récupère le nom (ex: "VGP")
+  
+  geoms <- lapply(df[[col]], geojson_to_sfg)
+  geoms <- st_sfc(geoms, crs = 4326)
+  result <- st_sf(df, geometry = geoms)
+  
+  assign(paste0(df_name, "_sf"), result, envir = .GlobalEnv)
+}
+
+compute_arc_length = function(arc) {
+  return(st_length(st_transform(arc, 32631))/1000)
+}
+
+ref_local_roads = rbind(Bd_St_Germain,Upper_bank,Lower_bank) %>% convert_to_sf(.,"geo_shape")
+ref_ring_roads = rbind(PI_control_clean,PI_north_control_clean,PE_north_control_clean,PE_control_clean)
+
+ref_local_roads$length = compute_arc_length(ref_local_roads)
+ref_ring_roads$length = compute_arc_length(ref_ring_roads)
+
+
+```
+
+
+# Speed function
+
+In the model, the speed is defined as $S(i,t) = \frac{Flow(i,t) * (L + Ki)}{Occupancy(i,t)}$ 
+```{r}
+
+compute_speed = function(df) {
+  df$speed = df$q *(vehicle_length + as.numeric(df$length))/df$k
+}
+
+```
+
+
+
 
 # Computing the model on ring road
 ```{r}
@@ -98,6 +145,8 @@ df_ring = loading_function(date_min,date_max) %>%
   filter(iu_ac %in% c(PE_north_control_clean$Identifiant.arc, PE_control_clean$Identifiant.arc,PI_control_clean$Identifiant.arc,PI_north_control_clean$Identifiant.arc))
 
 Final = categories_function_ring(df_ring)
+
+Final = Final %>% filter((is.na(q) & is.na(k))==F)
 
 did_model <- feols(
   q ~ treated * post | libelle + t_1h,
@@ -172,7 +221,7 @@ ggplot(results, aes(x = year_rel, y = beta, color = subset)) +
 
 
 # Computing the model on local road
-```{r}
+```{r, include=FALSE}
 ds <- open_dataset('./data/local.parquet')
 
 categories_function_local = function(df){
@@ -185,14 +234,14 @@ categories_function_local = function(df){
     mutate(wday = wday(ymd(date))) %>% # Day of the week (1 = Saturday, 2 = Monday, ..., 7 = Sunday)
     mutate(hours = hour(t_1h)) %>% # Hour of the day (0 to 23)
     mutate(day_hour = paste0(wday,'_',hours)) %>% # Wednesday at 8AM = "4_8" and Sunday at 7PM =  "7_19"
-    mutate(road = case_when(libelle %in% Upper_bank$Libelle ~ "LB",
+    mutate(road = case_when(libelle %in% Lower_bank$Libelle ~ "LB",
                             libelle %in% Upper_bank$Libelle ~ "UB",
                             libelle %in% Bd_St_Germain$Libelle ~ "BSG",
                             ))
   
-  Final$daytime = ifelse(Final$hours %in% c(8:20),TRUE,FALSE)
-  Final$morning = ifelse(Final$hours %in% c(8:10),TRUE,FALSE)
-  Final$evening = ifelse(Final$hours %in% c(18:20),TRUE,FALSE)
+  Final$daytime = ifelse(Final$hours %in% c(8:19),TRUE,FALSE)
+  Final$morning = ifelse(Final$hours %in% c(8:9),TRUE,FALSE)
+  Final$evening = ifelse(Final$hours %in% c(18:19),TRUE,FALSE)
   
   return(Final)
 }
@@ -204,6 +253,18 @@ df_local = loading_function(date_min,date_max)
 df_tot = rbind(df_ring,df_local)
 
 Final = categories_function_local(df_local)
+
+k_c = list()
+for (i in unique(Final$iu_ac)){
+  df = Final %>% filter(iu_ac == i, is.na(q) == F & is.na(k) == F)
+  if(nrow(df) == 0){k_c[i]=NA
+    }else{
+    k_c[i] = -coef(lm(q ~ 0 + k + I(k^2), data = df))[1]/(2*coef(lm(q ~ 0 + k + I(k^2), data = df))[2])
+    }
+}
+
+Final$kc = k_c[Final$iu_ac]
+Final$congestion = ifelse(Final$k > Final$kc,1,0)
 
 did_model <- feols(
   q ~ treated * post | libelle + t_1h,
@@ -359,18 +420,71 @@ compute_model_plot = function(variable){
     geom_errorbar(aes(ymin = ci_low, ymax = ci_high), width = 0, position = position_dodge(0.5)) +
     geom_line(position = position_dodge2(0.5))+
     labs(
-      x = "Année relative à la réforme",
-      y = "Effet estimé (β_k)",
-      title = "Effet estimé du traitement (event study)"
+      x = "Year relative to reform",
+      y = paste0("Estimated effect (β_k) on ",as.character(variable)),
+      title = "Estimated effect by time periods"
     ) +
     theme_minimal() + 
     scale_color_manual(values = c("black","darkgrey","darkblue"))
 }
 
 
-compute_model_plot("log_occupancy")
+
+plot_occupancy = compute_model_plot("log_occupancy")
+plot_flow = compute_model_plot("log_flow")
+plot_speed = compute_model_plot("log_speed")
+plot_congestion = compute_model_plot('congestion')
 
 
 ```
 
+```{r}
+
+
+library(dplyr)
+library(zoo)      # pour rollmean
+library(ggplot2)
+
+Final_na <- Final %>%
+  mutate(log_occupancy = na_if(log_occupancy, -Inf))
+
+df_monthly <- Final_na %>%
+  mutate(month = floor_date(date, "month")) %>%   # transforme la date en AAAA-MM-01
+  group_by(iu_ac, month, treated) %>%             # agrégation mensuelle par route
+  summarise(
+    mean_log_occ = mean(log_occupancy, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+df_roll <- df_monthly %>%
+  arrange(iu_ac, month) %>%
+  group_by(iu_ac) %>%
+  mutate(
+    occ_roll12 = zoo::rollmean(
+      mean_log_occ, 
+      k = 12,
+      align = "right",
+      fill = NA,
+      na.rm = TRUE
+    )
+  ) %>%
+  ungroup()
+
+df_roll_bis = df_roll %>% 
+  group_by(treated, month) %>% 
+  summarise(occ_roll12 = mean(occ_roll12,na.rm=TRUE))
+
+
+ggplot(df_roll_bis, aes(x = month, y = occ_roll12, color = factor(treated))) +
+  geom_line(size = 1.1) +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "Common trends — 12-month rolling mean",
+    x = "Month",
+    y = "Rolling mean of log occupancy"
+  )
+
+
+
+```
 
