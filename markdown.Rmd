@@ -15,7 +15,7 @@ To load the data correctly, the R-project file should be placed in dir containin
 3) the pollution.csv file (containing NO2 measures and meteorological data)
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(echo = FALSE,warning = FALSE,message=FALSE)
 
 # Load packages
 library(dplyr)
@@ -32,6 +32,8 @@ library(fixest)
 library(rlang)
 library(zoo)
 library(gridExtra)
+library(modelsummary)
+library(tidyverse)
 
 
 # This function loads the dataset between date_min and date_max (give them in format 'yyyy-mm-dd')
@@ -72,7 +74,7 @@ gc()
 
 
 # Computing arc roads
-```{r}
+```{r,echo = FALSE,warning = FALSE,message=FALSE}
 
 geojson_to_sfg <- function(geojson) {
   geo <- fromJSON(geojson)
@@ -123,7 +125,7 @@ $S = \frac{1500 * 0.204}{0.1} = 3060$ km/h !
 Since the author finds coherent values for her statistics that do not seem to reflect the formula. We chose to simply use the formula so that it fits the data, by ignoring vehicle length, and taking $Ki = 0.8$ meters for every roads. We chose this value by randomly sampling data points where the traffic was fluid (high flow and low occupancy rate), so that speed is at its maximum. We thus could calibrate it based on speed limitation (70 km/h on ring road, 50 km/h on local roads) and on speed statitics.
 
 
-```{r}
+```{r,echo = FALSE,warning = FALSE,message=FALSE}
 
 compute_speed_Sleiman = function(df) {
   return(df$q *(vehicle_length + as.numeric(df$length))/df$k)
@@ -136,45 +138,72 @@ compute_speed_corrected = function(df) {
 ```
 
 
+The dataset is composed of hourly observations at arc level. A road arc is a road segment monitored by one sensor corresponding to a unit of observation. The sensors detect occupancy rate (k) and flow (q). Occupancy rate gives the % of an hour that vehicles are located at the arc. Flow gives the quantity of cars passing through per hour. 
 
 
 # Computing the model on ring road
-```{r}
+```{r,echo = FALSE,warning = FALSE,message=FALSE}
 
-ds <- open_dataset('./data/ring.parquet')
-
-categories_function_ring = function(df){
-  Final_ring = df %>% 
-    mutate(treated = libelle %in% PE_control_clean$Libelle|libelle %in% PI_north_control_clean$Libelle) %>% # TRUE if arc is in the treated subset
-    mutate(post = ymd(as.Date(t_1h)) > ymd("2016-09-01")) %>% # After ou before the VGP closure
-    mutate(year_rel = floor(time_length(ymd(as.Date(t_1h)) - ymd("2016-08-31"), "year"))) %>% # year relative to VGP closure
-    mutate(log_flow = log(q),log_occupancy = log(k)) %>% # Log of the flow and occupancy of cars
-    mutate(date = as.Date(t_1h)) %>%
-    mutate(wday = wday(ymd(date))) %>% # Day of the week (1 = Saturday, 2 = Monday, ..., 7 = Sunday)
-    mutate(hours = hour(t_1h)) %>% # Hour of the day (0 to 23)
-    mutate(day_hour = paste0(wday,'_',hours)) %>% # Wednesday at 8AM = "4_8" and Sunday at 7PM =  "7_19"
-    mutate(north = libelle %in% PI_north_control_clean$Libelle|libelle %in% PE_north_control_clean$Libelle)
+tryCatch(load("./data/Final_ring.RData"), error = function(e){
   
-  Final_ring$daytime = ifelse(Final_ring$hours %in% c(8:20),TRUE,FALSE)
-  Final_ring$morning = ifelse(Final_ring$hours %in% c(8:10),TRUE,FALSE)
-  Final_ring$evening = ifelse(Final_ring$hours %in% c(18:20),TRUE,FALSE)
+  ds <- open_dataset('./data/ring.parquet')
   
-  return(Final_ring)
-}
+  categories_function_ring = function(df){
+    Final_ring = df %>% 
+      mutate(treated = libelle %in% PE_control_clean$Libelle|libelle %in% PI_north_control_clean$Libelle) %>% # TRUE if arc is in the treated subset
+      mutate(post = ymd(as.Date(t_1h)) > ymd("2016-09-01")) %>% # After ou before the VGP closure
+      mutate(year_rel = floor(time_length(ymd(as.Date(t_1h)) - ymd("2016-08-31"), "year"))) %>% # year relative to VGP closure
+      mutate(log_flow = log(q),log_occupancy = log(k)) %>% # Log of the flow and occupancy of cars
+      mutate(date = as.Date(t_1h)) %>%
+      mutate(wday = wday(ymd(date))) %>% # Day of the week (1 = Saturday, 2 = Monday, ..., 7 = Sunday)
+      mutate(hours = hour(t_1h)) %>% # Hour of the day (0 to 23)
+      mutate(day_hour = paste0(wday,'_',hours)) %>% # Wednesday at 8AM = "4_8" and Sunday at 7PM =  "7_19"
+      mutate(north = libelle %in% PI_north_control_clean$Libelle|libelle %in% PE_north_control_clean$Libelle)
+    
+    Final_ring$daytime = ifelse(Final_ring$hours %in% c(8:20),TRUE,FALSE)
+    Final_ring$morning = ifelse(Final_ring$hours %in% c(8:10),TRUE,FALSE)
+    Final_ring$evening = ifelse(Final_ring$hours %in% c(18:20),TRUE,FALSE)
+    
+    return(Final_ring)
+  }
+  
+  
+  date_min = "2013-09-01"
+  date_max = "2019-09-01"
+  df_ring = loading_function(date_min,date_max) %>% 
+    filter(iu_ac %in% c(PE_north_control_clean$Identifiant.arc, PE_control_clean$Identifiant.arc,PI_control_clean$Identifiant.arc,PI_north_control_clean$Identifiant.arc))
+  
+  Final_ring = categories_function_ring(df_ring)
+  
+  Final_ring = Final_ring %>% filter((is.na(q) & is.na(k))==F)
+  
+  k_c = list()
+  for (i in unique(Final_ring$iu_ac)){
+    df = Final_ring %>% filter(iu_ac == i, is.na(q) == F & is.na(k) == F)
+    if(nrow(df) == 0){k_c[i]=NA
+      }else{
+      k_c[i] = -coef(lm(q ~ 0 + k + I(k^2), data = df))[1]/(2*coef(lm(q ~ 0 + k + I(k^2), data = df))[2])
+      }
+  }
+  
+  Final_ring$kc = k_c[Final_ring$iu_ac]
+  Final_ring$congestion = ifelse(Final_ring$k > Final_ring$kc,1,0)
+  
+  Final_ring = left_join(Final_ring,ref_local_roads %>% select(Identifiant.arc,length),by=c('iu_ac'='Identifiant.arc'), relationship = "many-to-many")
+  Final_ring$length = as.numeric(Final_ring$length)
+  Final_ring$speed = compute_speed_corrected(Final_ring)
+  Final_ring$log_speed = log(Final_ring$speed)
+})
+
+```
 
 
-date_min = "2013-09-01"
-date_max = "2019-09-01"
-df_ring = loading_function(date_min,date_max) %>% 
-  filter(iu_ac %in% c(PE_north_control_clean$Identifiant.arc, PE_control_clean$Identifiant.arc,PI_control_clean$Identifiant.arc,PI_north_control_clean$Identifiant.arc))
 
-Final_ring = categories_function_ring(df_ring)
-
-Final_ring = Final_ring %>% filter((is.na(q) & is.na(k))==F)
-
+Model on ring roads - workind days and daytime
+```{r,echo = FALSE,warning = FALSE,message=FALSE}
 did_model <- feols(
   q ~ treated * post | libelle + t_1h,
-  data = Final_ring,
+  data = Final_ring %>% filter(wday %in% c(2:6), daytime == TRUE),
   cluster = ~libelle
 )
 
@@ -189,7 +218,7 @@ summary(did_model)
 compute_event_model = function(Final_ring,subset,variable) {
   
   if (!is.null(subset)){
-    df = Final_ring %>% filter(!!parse_expr(subset))
+    df = Final_ring %>% filter(!!parse_expr(subset)) %>% filter(wday %in% c(2:6), daytime == TRUE)
   } else {df = Final_ring}
   
   event_model <- feols(
@@ -242,62 +271,70 @@ ggplot(results, aes(x = year_rel, y = beta, color = subset)) +
 
 ```
 
+The graph above shows the effect of the GP closure on car occupancy rate. The vertical lines represent 95% confidence intervals. It compares all the arc roads in the ring sample and the South outer ring roads. However, it should be noted that the estimated effects during the pre-closure period are not zero, therefore there could be potential confounders (external factors affecting traffic prior to road closure, such as public transportation improvements) or anticipation effects (users changing their route or behavior in anticipation for the road closure)
 
 
 # Computing the model on local road
-```{r, include=FALSE}
-ds <- open_dataset('./data/local.parquet')
+```{r,echo = FALSE,warning = FALSE,message=FALSE}
 
-categories_function_local = function(df){
-  Final_local = df %>% 
-    mutate(treated = libelle %in% Bd_St_Germain$Libelle|libelle %in% Upper_bank$Libelle) %>% # TRUE if arc is in the treated subset
-    mutate(post = ymd(as.Date(t_1h)) > ymd("2016-09-01")) %>% # After ou before the VGP closure
-    mutate(year_rel = floor(time_length(ymd(as.Date(t_1h)) - ymd("2016-08-31"), "year"))) %>% # year relative to VGP closure
-    mutate(log_flow = log(q),log_occupancy = log(k)) %>% # Log of the flow and occupancy of cars
-    mutate(date = as.Date(t_1h)) %>%
-    mutate(wday = wday(ymd(date))) %>% # Day of the week (1 = Saturday, 2 = Monday, ..., 7 = Sunday)
-    mutate(hours = hour(t_1h)) %>% # Hour of the day (0 to 23)
-    mutate(day_hour = paste0(wday,'_',hours)) %>% # Wednesday at 8AM = "4_8" and Sunday at 7PM =  "7_19"
-    mutate(road = case_when(libelle %in% Lower_bank$Libelle ~ "LB",
-                            libelle %in% Upper_bank$Libelle ~ "UB",
-                            libelle %in% Bd_St_Germain$Libelle ~ "BSG",
-                            ))
+tryCatch(load("./data/Final_local.RData"), error = function(e){
+  ds <- open_dataset('./data/local.parquet')
   
-  Final_local$daytime = ifelse(Final_local$hours %in% c(8:19),TRUE,FALSE)
-  Final_local$morning = ifelse(Final_local$hours %in% c(8:9),TRUE,FALSE)
-  Final_local$evening = ifelse(Final_local$hours %in% c(18:19),TRUE,FALSE)
+  categories_function_local = function(df){
+    Final_local = df %>% 
+      mutate(treated = libelle %in% Bd_St_Germain$Libelle|libelle %in% Upper_bank$Libelle) %>% # TRUE if arc is in the treated subset
+      mutate(post = ymd(as.Date(t_1h)) > ymd("2016-09-01")) %>% # After ou before the VGP closure
+      mutate(year_rel = floor(time_length(ymd(as.Date(t_1h)) - ymd("2016-08-31"), "year"))) %>% # year relative to VGP closure
+      mutate(log_flow = log(q),log_occupancy = log(k)) %>% # Log of the flow and occupancy of cars
+      mutate(date = as.Date(t_1h)) %>%
+      mutate(wday = wday(ymd(date))) %>% # Day of the week (1 = Saturday, 2 = Monday, ..., 7 = Sunday)
+      mutate(hours = hour(t_1h)) %>% # Hour of the day (0 to 23)
+      mutate(day_hour = paste0(wday,'_',hours)) %>% # Wednesday at 8AM = "4_8" and Sunday at 7PM =  "7_19"
+      mutate(road = case_when(libelle %in% Lower_bank$Libelle ~ "LB",
+                              libelle %in% Upper_bank$Libelle ~ "UB",
+                              libelle %in% Bd_St_Germain$Libelle ~ "BSG",
+                              ))
+    
+    Final_local$daytime = ifelse(Final_local$hours %in% c(8:19),TRUE,FALSE)
+    Final_local$morning = ifelse(Final_local$hours %in% c(8:9),TRUE,FALSE)
+    Final_local$evening = ifelse(Final_local$hours %in% c(18:19),TRUE,FALSE)
+    
+    return(Final_local)
+  }
   
-  return(Final_local)
-}
+  date_min = "2013-09-01"
+  date_max = "2019-09-01"
+  df_local = loading_function(date_min,date_max)
+  
+  
+  Final_local = categories_function_local(df_local)
+  
+  k_c = list()
+  for (i in unique(Final_local$iu_ac)){
+    df = Final_local %>% filter(iu_ac == i, is.na(q) == F & is.na(k) == F)
+    if(nrow(df) == 0){k_c[i]=NA
+      }else{
+      k_c[i] = -coef(lm(q ~ 0 + k + I(k^2), data = df))[1]/(2*coef(lm(q ~ 0 + k + I(k^2), data = df))[2])
+      }
+  }
+  
+  Final_local$kc = k_c[Final_local$iu_ac]
+  Final_local$congestion = ifelse(Final_local$k > Final_local$kc,1,0)
+  
+  Final_local = left_join(Final_local,ref_local_roads %>% select(Identifiant.arc,length),by=c('iu_ac'='Identifiant.arc'), relationship = "many-to-many")
+  Final_local$length = as.numeric(Final_local$length)
+  Final_local$speed = compute_speed_corrected(Final_local)
+  Final_local$log_speed = log(Final_local$speed)
+})
+```
 
-date_min = "2013-09-01"
-date_max = "2019-09-01"
-df_local = loading_function(date_min,date_max)
 
 
-Final_local = categories_function_local(df_local)
-
-k_c = list()
-for (i in unique(Final_local$iu_ac)){
-  df = Final_local %>% filter(iu_ac == i, is.na(q) == F & is.na(k) == F)
-  if(nrow(df) == 0){k_c[i]=NA
-    }else{
-    k_c[i] = -coef(lm(q ~ 0 + k + I(k^2), data = df))[1]/(2*coef(lm(q ~ 0 + k + I(k^2), data = df))[2])
-    }
-}
-
-Final_local$kc = k_c[Final_local$iu_ac]
-Final_local$congestion = ifelse(Final_local$k > Final_local$kc,1,0)
-
-Final_local = left_join(Final_local,ref_local_roads %>% select(Identifiant.arc,length),by=c('iu_ac'='Identifiant.arc'), relationship = "many-to-many")
-Final_local$length = as.numeric(Final_local$length)
-Final_local$speed = compute_speed_corrected(Final_local)
-Final_local$log_speed = log(Final_local$speed)
-
-
+Model on local roads - workind days and daytime
+```{r,echo = FALSE,warning = FALSE,message=FALSE}
 did_model <- feols(
   q ~ treated * post | iu_ac + t_1h,
-  data = Final_local,
+  data = Final_local %>% filter(wday %in% c(2:6), daytime == TRUE),
   cluster = ~iu_ac
 )
 
@@ -312,8 +349,8 @@ summary(did_model)
 compute_event_model = function(Final_local,subset,variable) {
   
   if (!is.null(subset)){
-    df = Final_local %>% filter(!!parse_expr(subset))
-  } else {df = Final_local}
+    df = Final_local %>% filter(!!parse_expr(subset))  %>% filter(wday %in% c(2:6), daytime == TRUE)
+  } else {df = Final_local %>% filter(wday %in% c(2:6), daytime == TRUE)}
   
   event_model <- feols(
     k ~ i(year_rel, treated, ref = "-1") | iu_ac + day_hour,
@@ -341,13 +378,13 @@ compute_event_model = function(Final_local,subset,variable) {
   return(results)
 }
 
-results_all = compute_event_model(Final_local,subset = NULL,k)
+results_all = compute_event_model(Final_local  %>% filter(wday %in% c(2:6), daytime == TRUE),subset = NULL,k)
 results_all$subset = "all"
 
-results_BSG = compute_event_model(Final_local, subset = "road != \"UB\"",k)
+results_BSG = compute_event_model(Final_local %>% filter(wday %in% c(2:6), daytime == TRUE), subset = "road != \"UB\"",k)
 results_BSG$subset = "BSG"
 
-results_UB = compute_event_model(Final_local, subset = "road != \"BSG\"",k)
+results_UB = compute_event_model(Final_local %>% filter(wday %in% c(2:6), daytime == TRUE), subset = "road != \"BSG\"",k)
 results_UB$subset = "UB"
 
 results = rbind(results_all,results_BSG,results_UB)
@@ -367,9 +404,226 @@ ggplot(results, aes(x = year_rel, y = beta, color = subset)) +
                      labels = c("all" = "Full sample - local", "BSG" = "Bd St Germain only", "UB" = "Upper bank only"))
 
 ```
+The same graph can be computed for the local roads. This time, pre-closure tendencies are consistent with the difference-in-difference model assumptions.
 
 
-```{r}
+# Event model on the ring roads
+
+
+
+```{r,echo = FALSE,warning = FALSE,message=FALSE}
+
+Final = Final_ring
+
+compute_model_plot = function(variable){
+  
+  fml <- as.formula(paste0(variable, " ~ i(year_rel, treated, ref = '-1') | libelle + day_hour"))
+  
+  event_model_daytime <- feols(
+    fml,
+    data = Final %>% filter(daytime == TRUE, north == FALSE, wday %in% c(2:6)),
+    cluster = ~libelle
+  )
+  event_model_evening <- feols(
+    fml,
+    data = Final %>% filter(evening == TRUE, north == FALSE, wday %in% c(2:6)),
+    cluster = ~libelle
+  )
+  event_model_morning <- feols(
+    fml,
+    data = Final %>% filter(morning == TRUE, north == FALSE, wday %in% c(2:6)),
+    cluster = ~libelle
+  )
+  
+  
+  betas_morning <- coef(event_model_morning)
+  ses_morning <- se(event_model_morning)
+  
+  results_morning <- data.frame(
+    coef_name = names(betas_morning),
+    beta = betas_morning,
+    se = ses_morning,
+    ci_low = betas_morning - 1.96 * ses_morning,
+    ci_high = betas_morning + 1.96 * ses_morning
+  )
+  
+  betas_evening <- coef(event_model_evening)
+  ses_evening <- se(event_model_evening)
+  
+  results_evening <- data.frame(
+    coef_name = names(betas_evening),
+    beta = betas_evening,
+    se = ses_evening,
+    ci_low = betas_evening - 1.96 * ses_evening,
+    ci_high = betas_evening + 1.96 * ses_evening
+  )
+  
+  betas_daytime <- coef(event_model_daytime)
+  ses_daytime <- se(event_model_daytime)
+  
+  results_daytime <- data.frame(
+    coef_name = names(betas_daytime),
+    beta = betas_daytime,
+    se = ses_daytime,
+    ci_low = betas_daytime - 1.96 * ses_daytime,
+    ci_high = betas_daytime + 1.96 * ses_daytime
+  )
+  
+  results_morning = results_morning %>% mutate(year_rel = sapply(coef_name,function(x) {return(unlist(str_split(x,":"))[3])}) %>% as.numeric())
+  results_morning[6,] = c("year_rel::-1:treated",0,0,0,0,-1)
+  results_morning = results_morning %>% select(-coef_name) %>% mutate(across(everything(),as.numeric))
+  
+  results_evening = results_evening %>% mutate(year_rel = sapply(coef_name,function(x) {return(unlist(str_split(x,":"))[3])}) %>% as.numeric())
+  results_evening[6,] = c("year_rel::-1:treated",0,0,0,0,-1)
+  results_evening = results_evening %>% select(-coef_name) %>% mutate(across(everything(),as.numeric))
+  
+  results_daytime = results_daytime %>% mutate(year_rel = sapply(coef_name,function(x) {return(unlist(str_split(x,":"))[3])}) %>% as.numeric())
+  results_daytime[6,] = c("year_rel::-1:treated",0,0,0,0,-1)
+  results_daytime = results_daytime %>% select(-coef_name) %>% mutate(across(everything(),as.numeric))
+  
+  
+  
+  results_daytime$hour = "daytime"
+  results_morning$hour = 'morning'
+  results_evening$hour = "evening"
+  
+  results = rbind(results_daytime,results_evening,results_morning)
+  
+  ggplot(results, aes(x = year_rel, y = beta, color = hour, shape = hour)) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray") +
+    geom_point(size = 2, position = position_dodge2(0.5)) +
+    geom_errorbar(aes(ymin = ci_low, ymax = ci_high), width = 0, position = position_dodge(0.5)) +
+    geom_line(position = position_dodge2(0.5))+
+    labs(
+      x = "Year relative to reform",
+      y = paste0("Estimated effect (β_k) on ",as.character(variable)),
+      ) +
+    theme_minimal() + 
+    theme(axis.title.y = element_text(size = 6)) 
+    scale_color_manual(values = c("black","darkgrey","darkblue"))
+}
+
+
+
+plot_occupancy = compute_model_plot("log_occupancy")
+plot_flow = compute_model_plot("log_flow")
+plot_speed = compute_model_plot("log_speed")
+plot_congestion = compute_model_plot('congestion')
+
+combined = grid.arrange(plot_occupancy,plot_flow,plot_speed,plot_congestion)
+```
+
+
+
+# Event model on the local roads
+```{r,echo = FALSE,warning = FALSE,message=FALSE}
+
+Final = Final_local
+
+compute_model_plot = function(variable){
+  
+  fml <- as.formula(paste0(variable, " ~ i(year_rel, treated, ref = '-1') | libelle + day_hour"))
+  
+  event_model_daytime <- feols(
+    fml,
+    data = Final %>% filter(daytime == TRUE, road %in% c("BSG","UB","LB"), wday %in% c(2:6)),
+    cluster = ~libelle
+  )
+  event_model_evening <- feols(
+    fml,
+    data = Final %>% filter(evening == TRUE, road %in% c("BSG","UB","LB"), wday %in% c(2:6)),
+    cluster = ~libelle
+  )
+  event_model_morning <- feols(
+    fml,
+    data = Final %>% filter(morning == TRUE, road %in% c("BSG","UB","LB"), wday %in% c(2:6)),
+    cluster = ~libelle
+  )
+  
+  
+  betas_morning <- coef(event_model_morning)
+  ses_morning <- se(event_model_morning)
+  
+  results_morning <- data.frame(
+    coef_name = names(betas_morning),
+    beta = betas_morning,
+    se = ses_morning,
+    ci_low = betas_morning - 1.96 * ses_morning,
+    ci_high = betas_morning + 1.96 * ses_morning
+  )
+  
+  betas_evening <- coef(event_model_evening)
+  ses_evening <- se(event_model_evening)
+  
+  results_evening <- data.frame(
+    coef_name = names(betas_evening),
+    beta = betas_evening,
+    se = ses_evening,
+    ci_low = betas_evening - 1.96 * ses_evening,
+    ci_high = betas_evening + 1.96 * ses_evening
+  )
+  
+  betas_daytime <- coef(event_model_daytime)
+  ses_daytime <- se(event_model_daytime)
+  
+  results_daytime <- data.frame(
+    coef_name = names(betas_daytime),
+    beta = betas_daytime,
+    se = ses_daytime,
+    ci_low = betas_daytime - 1.96 * ses_daytime,
+    ci_high = betas_daytime + 1.96 * ses_daytime
+  )
+  
+  results_morning = results_morning %>% mutate(year_rel = sapply(coef_name,function(x) {return(unlist(str_split(x,":"))[3])}) %>% as.numeric())
+  results_morning[6,] = c("year_rel::-1:treated",0,0,0,0,-1)
+  results_morning = results_morning %>% select(-coef_name) %>% mutate(across(everything(),as.numeric))
+  
+  results_evening = results_evening %>% mutate(year_rel = sapply(coef_name,function(x) {return(unlist(str_split(x,":"))[3])}) %>% as.numeric())
+  results_evening[6,] = c("year_rel::-1:treated",0,0,0,0,-1)
+  results_evening = results_evening %>% select(-coef_name) %>% mutate(across(everything(),as.numeric))
+  
+  results_daytime = results_daytime %>% mutate(year_rel = sapply(coef_name,function(x) {return(unlist(str_split(x,":"))[3])}) %>% as.numeric())
+  results_daytime[6,] = c("year_rel::-1:treated",0,0,0,0,-1)
+  results_daytime = results_daytime %>% select(-coef_name) %>% mutate(across(everything(),as.numeric))
+  
+  
+  
+  results_daytime$hour = "daytime"
+  results_morning$hour = 'morning'
+  results_evening$hour = "evening"
+  
+  results = rbind(results_daytime,results_evening,results_morning)
+  
+  ggplot(results, aes(x = year_rel, y = beta, color = hour, shape = hour)) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "gray") +
+    geom_point(size = 2, position = position_dodge2(0.5)) +
+    geom_errorbar(aes(ymin = ci_low, ymax = ci_high), width = 0, position = position_dodge(0.5)) +
+    geom_line(position = position_dodge2(0.5))+
+    labs(
+      x = "Year relative to reform",
+      y = paste0("Estimated effect (β_k) on ",as.character(variable)),
+      ) +
+    theme_minimal() + 
+    ggtitle(as.character(variable)) +
+    scale_color_manual(values = c("black","darkgrey","darkblue"))
+}
+
+
+
+plot_occupancy = compute_model_plot("log_occupancy")
+plot_flow = compute_model_plot("log_flow")
+plot_speed = compute_model_plot("log_speed")
+plot_congestion = compute_model_plot('congestion')
+
+combined = grid.arrange(plot_occupancy,plot_flow,plot_speed,plot_congestion)
+```
+
+
+
+
+
+# Event model on the local roads
+```{r,echo = FALSE,warning = FALSE,message=FALSE}
 
 Final = Final_local
 
@@ -470,7 +724,12 @@ plot_congestion = compute_model_plot('congestion')
 combined = grid.arrange(plot_occupancy,plot_flow,plot_speed,plot_congestion)
 ```
 
-```{r}
+
+
+
+# Long run analysis to check for parallel trends assumptions
+
+```{r,echo = FALSE,warning = FALSE,message=FALSE}
 
 
 library(dplyr)
@@ -527,10 +786,43 @@ local_flow = long_run_tendency(Final_local, log_flow, "local")
 ring_flow = long_run_tendency(Final_ring,log_flow,"ring")
 ring_occup = long_run_tendency(Final_ring, log_occupancy, "local")
 
+
+grid.arrange(local_occup,local_flow,ring_flow,ring_occup)
+
 ```
+
+
 # Air pollution
 
+
+
+First we extract the effect of VGP closure on the log of speed for ring roads and local roads.
+
 ```{r}
+did_model_speed_local <- feols(
+  log_speed ~ treated * post | iu_ac + t_1h,
+  data = Final_local %>% filter(wday %in% c(2:6), daytime == TRUE),
+  cluster = ~iu_ac
+)
+
+did_model_speed_ring <- feols(
+  log_speed ~ treated * post | iu_ac + t_1h,
+  data = Final_ring %>% filter(wday %in% c(2:6), daytime == TRUE),
+  cluster = ~iu_ac
+)
+
+modelsummary(
+  list("Ring" = did_model_speed_ring, "Local" = did_model_speed_local),
+  stars = TRUE,
+  output = "markdown",
+  shape = "rbind")
+```
+
+
+
+
+
+```{r,echo = FALSE,warning = FALSE,message=FALSE}
 pollution = read.csv("pollution.csv") %>% mutate(hour = hour(ymd_hms(date))) %>% mutate(date = as.Date(date)) %>% rename(wnd_direction = direction, wnd_speed = speed, wnd_tmp = tmp)
 
 pollution$hour[is.na(pollution$hour)] = 0
@@ -554,11 +846,31 @@ pollution_ring = left_join(df_ring_pollution,pollution %>% filter(loc == "ring")
 pollution_ub = left_join(df_ub_pollution,pollution %>% filter(loc == "VGP"),by=c('date'='date','hours'='hour'),relationship = "many-to-many")
 
 
-model_pollution = feols(log(NO2) ~ log_speed + q + wnd_speed + wnd_direction + wnd_tmp | hours + month(date) + wday,
+model_pollution_ub = feols(log(NO2) ~ log_speed + q + wnd_speed + wnd_direction + wnd_tmp | hours + month(date) + wday,
     data = pollution_ub %>% filter(is.na(log_speed) == F,abs(log_speed)!=Inf),
     cluster = ~iu_ac)
 
+model_pollution_ring = feols(log(NO2) ~ log_speed + q + wnd_speed + wnd_direction + wnd_tmp | hours + month(date) + wday,
+    data = pollution_ring %>% filter(is.na(log_speed) == F,abs(log_speed)!=Inf),
+    cluster = ~iu_ac)
 
-summary(model_pollution)
+
+modelsummary(
+  list("Ring" = model_pollution_ring, "Local (UB)" = model_pollution_ub),
+  stars = TRUE,
+  output = "markdown",
+  shape = "rbind",
+  coef_map = list(
+    "log_speed" = "Log(Speed)",
+    "q" = "Flow",
+    "wnd_speed" = "Wind speed",
+    "wnd_direction" = "Wind direction",
+    "wnd_tmp" = "Wind temperature"
+  )
+)
 ```
+
+Here we show the table that estimates coefficients for fixed effects listed in the right hand column while controlling for seasonal (monthly) effects, week day effects, and the 24 hour day cycle. The elasticity of ln(NO2) with respect to ln(speed) is -0.17 for ring roads and -0.05 for local roads, which is significant at p < 0.001.
+
+Therefore, it can be computed that the VGP closure is associated with a -0.21* increase in ln(NO2) concentrations for ring roads and a 
 
