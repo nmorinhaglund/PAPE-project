@@ -872,5 +872,5 @@ modelsummary(
 
 Here we show the table that estimates coefficients for fixed effects listed in the right hand column while controlling for seasonal (monthly) effects, week day effects, and the 24 hour day cycle. The elasticity of ln(NO2) with respect to ln(speed) is -0.17 for ring roads and -0.05 for local roads, which is significant at p < 0.001.
 
-Therefore, it can be computed that the VGP closure is associated with a -0.21* increase in ln(NO2) concentrations for ring roads and a 
+Therefore, it can be computed that the VGP closure is associated with a $-0.21*-0.05 = 0.01$ increase in ln(NO2) concentrations for local roads and a increase of $-0.11*-0.17 = 0.019$ in ln(N02) for ring roads.
 
